@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/memx-ai/"><img src="https://img.shields.io/pypi/v/memx-ai?color=blue" alt="PyPI"></a>
+  <a href="https://pypi.org/project/memx-os/"><img src="https://img.shields.io/pypi/v/memx-os?color=blue" alt="PyPI"></a>
   <a href="https://github.com/mohitbadi/memx-ai/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="Python"></a>
 </p>
@@ -62,9 +62,9 @@ pip install -e .                       # Core installation
 
 **Option 2: From PyPI**
 ```bash
-pip install memx-ai                    # Core (FAISS + NumPy)
-pip install "memx-ai[embeddings]"      # + sentence-transformers
-pip install "memx-ai[all]"             # Everything
+pip install memx-os                    # Core (FAISS + NumPy)
+pip install "memx-os[embeddings]"      # + sentence-transformers
+pip install "memx-os[all]"             # Everything
 ```
 
 ### 5-Line Memory OS
