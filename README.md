@@ -52,6 +52,15 @@ m.inspect("programming")  # explains why results scored
 
 ### Install
 
+**Option 1: From GitHub (Latest Features)**
+```bash
+git clone https://github.com/mohitbadi/memx-ai
+cd memx-ai
+pip install -e .                       # Core installation
+# pip install -e ".[all]"              # To include LLM embeddings & integrations
+```
+
+**Option 2: From PyPI**
 ```bash
 pip install memx-ai                    # Core (FAISS + NumPy)
 pip install "memx-ai[embeddings]"      # + sentence-transformers
