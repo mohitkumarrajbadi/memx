@@ -140,4 +140,6 @@ def create_updated_memory(
         namespace=old.namespace,
         source="update",
         metadata={**old.metadata, "supersedes": old.id},
+        level=old.level,
+        tokens=set(re.findall(r"\w+", combined.lower())),
     )

@@ -40,6 +40,8 @@ class Memory:
     source: str = ""                # origin: "user", "agent", "reflection", "compression"
     superseded_by: Optional[str] = None   # ID of memory that replaced this one
     active: bool = True             # False = soft-deleted / decayed
+    level: str = "working"          # working | short | long | concept
+    tokens: set = field(default_factory=set) # Pre-tokenized for fast retrieval
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -54,6 +56,8 @@ class Memory:
             "namespace": self.namespace,
             "source": self.source,
             "active": self.active,
+            "level": self.level,
+            "tokens": list(self.tokens),
             "metadata": self.metadata,
         }
 

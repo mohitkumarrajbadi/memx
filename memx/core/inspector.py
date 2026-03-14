@@ -29,8 +29,7 @@ def explain_retrieval(
     now = now or time.time()
 
     query_tokens = set(re.findall(r"\w+", query.lower()))
-    content_tokens = set(re.findall(r"\w+", memory.content.lower()))
-    matched = query_tokens & content_tokens
+    matched = query_tokens & memory.tokens
     keyword_score = min(len(matched) / max(len(query_tokens), 1), 1.0)
 
     recency_score = compute_recency_score(memory.timestamp, now)

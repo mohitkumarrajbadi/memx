@@ -9,9 +9,9 @@ import hashlib
 import time
 import logging
 import re
-import threading
 from typing import List, Optional, Dict, Callable
 
+import numba
 import numpy as np
 
 from ..types import Memory, MemoryType, RetrievalExplanation
@@ -20,11 +20,14 @@ from .embeddings import Embedder
 from .vector import VectorIndex
 from .kv import KVCache
 from .graph import CausalGraph
+from .utils import RWLock, ReadContext, WriteContext, LRUCache
 from .importance import (
     estimate_importance,
     compute_recency_score,
     compute_frequency_score,
     run_decay_sweep,
+    _FREQUENCY_LOG_BASE,
+    _MAX_FREQUENCY_BONUS,
 )
 from .updater import detect_contradiction, find_merge_candidates, create_updated_memory
 from .inspector import explain_retrieval
@@ -39,6 +42,40 @@ _W_RECENCY = 0.15
 _W_FREQUENCY = 0.10
 
 _RECENCY_HALF_LIFE = 3600.0 * 24  # 24h
+
+@numba.njit(fastmath=True)
+def fast_hybrid_score(
+    v_vec: np.ndarray,
+    v_imp: np.ndarray,
+    v_ts: np.ndarray,
+    v_ac: np.ndarray,
+    v_kw: np.ndarray,
+    now: float,
+    w_vector: float,
+    w_keyword: float,
+    w_importance: float,
+    w_recency: float,
+    w_frequency: float,
+    recency_half_life: float,
+    frequency_log_base: float,
+    max_frequency_bonus: float,
+) -> np.ndarray:
+    n = len(v_vec)
+    out = np.empty(n, dtype=np.float32)
+    for i in range(n):
+        age = max(now - v_ts[i], 0.0)
+        recency = 2.0 ** (-age / recency_half_life)
+        
+        freq = min(np.log1p(v_ac[i]) / np.log(frequency_log_base), max_frequency_bonus)
+        
+        out[i] = (
+            w_vector * v_vec[i]
+            + w_keyword * v_kw[i]
+            + w_importance * v_imp[i]
+            + w_recency * recency
+            + w_frequency * freq
+        )
+    return out
 
 
 class BrainTrace:
@@ -63,7 +100,8 @@ class BrainTrace:
         self.kv = KVCache()
         self.graph = CausalGraph()
         self.backend = backend
-        self._lock = threading.Lock()
+        self._lock = RWLock()
+        self.working_memory = LRUCache(capacity=100)
         self._id_order: List[str] = []
 
     # ══════════════════════════════════════════════════════════════
@@ -87,7 +125,7 @@ class BrainTrace:
         imp = importance if importance is not None else estimate_importance(content)
         now = time.time()
 
-        with self._lock:
+        with WriteContext(self._lock):
             if mem_id in self.kv:
                 return mem_id
 
@@ -102,11 +140,13 @@ class BrainTrace:
                 importance=imp,
                 namespace=namespace,
                 source=source,
+                tokens=set(re.findall(r"\w+", content.lower())),
             )
 
             self.vector_index.add(vector)
             self._id_order.append(mem_id)
             self.kv.set(mem_id, memory)
+            self.working_memory.clear()
 
         if self.backend is not None:
             try:
@@ -136,13 +176,14 @@ class BrainTrace:
         updated = create_updated_memory(old, new_content, new_vector, merge=merge)
 
         # Deactivate old
-        with self._lock:
+        with WriteContext(self._lock):
             old.active = False
             old.superseded_by = updated.id
 
             self.vector_index.add(updated.vector)
             self._id_order.append(updated.id)
             self.kv.set(updated.id, updated)
+            self.working_memory.clear()
 
         if self.backend is not None:
             try:
@@ -159,6 +200,7 @@ class BrainTrace:
         if mem is None:
             return False
         mem.active = False
+        self.working_memory.clear()
         return True
 
     # ══════════════════════════════════════════════════════════════
@@ -176,9 +218,14 @@ class BrainTrace:
 
         Scoring: vector similarity + keyword overlap + importance + recency + frequency.
         """
+        query_key = f"{query}:{top_k}:{namespace}:{include_inactive}"
+        cached = self.working_memory.get(query_key)
+        if cached is not None:
+            return cached
+
         query_vec = self.embedder.encode(query)
 
-        with self._lock:
+        with ReadContext(self._lock):
             if self.kv.size == 0:
                 return []
             scores, indices = self.vector_index.search(query_vec, top_k=min(top_k * 5, self.kv.size))
@@ -186,8 +233,15 @@ class BrainTrace:
 
         now = time.time()
         query_tokens = set(re.findall(r"\w+", query.lower()))
+        q_len = max(len(query_tokens), 1)
 
-        results: List[Memory] = []
+        mems_to_score = []
+        vec_scores = []
+        importances = []
+        timestamps = []
+        access_counts = []
+        keyword_scores = []
+
         for idx, vec_score in zip(indices, scores):
             idx = int(idx)
             if idx < 0 or idx >= len(id_snap):
@@ -200,31 +254,42 @@ class BrainTrace:
             if namespace and mem.namespace != namespace:
                 continue
 
-            # Keyword overlap
-            content_tokens = set(re.findall(r"\w+", mem.content.lower()))
-            matched = query_tokens & content_tokens
-            keyword_score = min(len(matched) / max(len(query_tokens), 1), 1.0)
+            mems_to_score.append(mem)
+            vec_scores.append(float(vec_score))
+            importances.append(mem.importance)
+            timestamps.append(mem.timestamp)
+            access_counts.append(mem.access_count)
+            
+            overlap = len(query_tokens & mem.tokens)
+            keyword_scores.append(min(overlap / q_len, 1.0))
 
-            # Recency & frequency
-            recency = compute_recency_score(mem.timestamp, now, _RECENCY_HALF_LIFE)
-            frequency = compute_frequency_score(mem.access_count)
+        if not mems_to_score:
+            return []
 
-            # Composite score
-            combined = (
-                _W_VECTOR * float(vec_score)
-                + _W_KEYWORD * keyword_score
-                + _W_IMPORTANCE * mem.importance
-                + _W_RECENCY * recency
-                + _W_FREQUENCY * frequency
-            )
+        # Vectorized scoring (Numba JIT)
+        v_vec = np.array(vec_scores, dtype=np.float32)
+        v_imp = np.array(importances, dtype=np.float32)
+        v_ts = np.array(timestamps, dtype=np.float32)
+        v_ac = np.array(access_counts, dtype=np.float32)
+        v_kw = np.array(keyword_scores, dtype=np.float32)
 
+        combined_scores = fast_hybrid_score(
+            v_vec, v_imp, v_ts, v_ac, v_kw, now,
+            _W_VECTOR, _W_KEYWORD, _W_IMPORTANCE, _W_RECENCY, _W_FREQUENCY,
+            _RECENCY_HALF_LIFE, _FREQUENCY_LOG_BASE, _MAX_FREQUENCY_BONUS
+        )
+
+
+        results: List[Memory] = []
+        for i, mem in enumerate(mems_to_score):
             scored = Memory(
                 id=mem.id, type=mem.type, content=mem.content,
-                vector=mem.vector, timestamp=mem.timestamp, score=combined,
+                vector=mem.vector, timestamp=mem.timestamp, score=float(combined_scores[i]),
                 metadata=mem.metadata, importance=mem.importance,
                 access_count=mem.access_count, last_accessed=mem.last_accessed,
                 namespace=mem.namespace, source=mem.source,
                 superseded_by=mem.superseded_by, active=mem.active,
+                level=mem.level, tokens=mem.tokens,
             )
             results.append(scored)
 
@@ -238,6 +303,7 @@ class BrainTrace:
                 original.access_count += 1
                 original.last_accessed = now
 
+        self.working_memory.put(query_key, top_results)
         return top_results
 
     # ══════════════════════════════════════════════════════════════
@@ -253,7 +319,7 @@ class BrainTrace:
         """Explain why memories are retrieved for a query."""
         query_vec = self.embedder.encode(query)
 
-        with self._lock:
+        with ReadContext(self._lock):
             if self.kv.size == 0:
                 return []
             scores, indices = self.vector_index.search(query_vec, top_k=min(top_k * 5, self.kv.size))
@@ -299,9 +365,10 @@ class BrainTrace:
         # Store compressed memories
         for cm in compressed:
             self.vector_index.add(cm.vector)
-            with self._lock:
+            with WriteContext(self._lock):
                 self._id_order.append(cm.id)
                 self.kv.set(cm.id, cm)
+                self.working_memory.clear()
             if self.backend:
                 try:
                     self.backend.save(cm)
@@ -327,9 +394,10 @@ class BrainTrace:
 
         for ref in reflections:
             self.vector_index.add(ref.vector)
-            with self._lock:
+            with WriteContext(self._lock):
                 self._id_order.append(ref.id)
                 self.kv.set(ref.id, ref)
+                self.working_memory.clear()
             if self.backend:
                 try:
                     self.backend.save(ref)
@@ -349,9 +417,10 @@ class BrainTrace:
         ref = reflect_on_conversation(messages, self.embedder, summarizer)
         if ref:
             self.vector_index.add(ref.vector)
-            with self._lock:
+            with WriteContext(self._lock):
                 self._id_order.append(ref.id)
                 self.kv.set(ref.id, ref)
+                self.working_memory.clear()
             if self.backend:
                 try:
                     self.backend.save(ref)
@@ -396,11 +465,12 @@ class BrainTrace:
                 if mem.namespace == namespace:
                     mem.active = False
         else:
-            with self._lock:
+            with WriteContext(self._lock):
                 self.kv.clear()
                 self.vector_index.reset()
                 self.graph.clear()
                 self._id_order.clear()
+                self.working_memory.clear()
 
     def stats(self, namespace: Optional[str] = None) -> Dict:
         mems = self.all_memories(namespace)

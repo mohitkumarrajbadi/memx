@@ -1,14 +1,15 @@
 """FAISS-backed vector index for nearest-neighbour search."""
 
-import threading
 from typing import Tuple
 
 import faiss
 import numpy as np
 
+from .utils import RWLock, ReadContext, WriteContext
+
 
 class VectorIndex:
-    """Thread-safe wrapper around a FAISS ``IndexFlatIP`` (inner-product / cosine).
+    """Thread-safe wrapper around a FAISS ``IndexHNSWFlat`` (inner-product / cosine).
 
     Vectors **must** be L2-normalised before insertion so that inner-product
     equals cosine similarity.  All operations are guarded by a ``threading.Lock``
@@ -17,12 +18,13 @@ class VectorIndex:
 
     def __init__(self, dim: int = 384):
         self.dim = dim
-        self.index: faiss.IndexFlatIP = faiss.IndexFlatIP(dim)
-        self._lock = threading.Lock()
+        self.index = faiss.IndexHNSWFlat(dim, 32, faiss.METRIC_INNER_PRODUCT)
+        self.index.hnsw.efSearch = 128
+        self._lock = RWLock()
 
     @property
     def size(self) -> int:
-        with self._lock:
+        with ReadContext(self._lock):
             return self.index.ntotal
 
     def add(self, vector: np.ndarray) -> None:
@@ -30,13 +32,13 @@ class VectorIndex:
         vec = np.ascontiguousarray(vector, dtype=np.float32)
         if vec.ndim == 1:
             vec = vec.reshape(1, -1)
-        with self._lock:
+        with WriteContext(self._lock):
             self.index.add(vec)
 
     def search(self, query: np.ndarray, top_k: int = 5) -> Tuple[np.ndarray, np.ndarray]:
         """Return ``(scores, indices)`` arrays of shape ``(top_k,)``."""
         q = np.ascontiguousarray(query, dtype=np.float32).reshape(1, -1)
-        with self._lock:
+        with ReadContext(self._lock):
             n = self.index.ntotal
             k = min(top_k, n) if n > 0 else 0
             if k == 0:
@@ -46,5 +48,5 @@ class VectorIndex:
 
     def reset(self) -> None:
         """Remove all vectors."""
-        with self._lock:
+        with WriteContext(self._lock):
             self.index.reset()
