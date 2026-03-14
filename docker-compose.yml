@@ -1,0 +1,13 @@
+version: "3.8"
+
+services:
+  memx-demo:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - MEMX_BACKEND=sqlite
+      - MEMX_DB_PATH=/app/data/memx.db
+    command: ["python", "examples/bharatsearch.py"]
